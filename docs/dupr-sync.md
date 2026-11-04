@@ -27,12 +27,27 @@ What one run does:
    (The timestamp is ISO UTC; the app reads it with `parseDbTimestamp` in
    `src/lib/formatters.ts`, which also accepts SQLite's `datetime('now')`
    shape should a run ever write that.)
-5. Posts a summary (updated / skipped / failed / mismatched names, and the
-   biggest rating moves since last week, flagging any move over 0.500) back
-   to the session.
+5. Posts a summary (updated / skipped / failed / mismatched names, every
+   rating that moved since last week, flagging any move over 0.500, and any
+   two profiles sharing one link) back to the session.
+6. **Emails that summary to hun@ghkim.com** through the Gmail connector. The
+   subject carries the outcome (`DUPR sync <date>: 53 updated, 12 changed,
+   0 failed` or `DUPR sync <date> FAILED: <reason>`), and a failed run still
+   sends, with the one fix to make. Only a missing Gmail connector stops the
+   email.
 
 The task's full prompt lives outside the repo at
 `~/.claude/scheduled-tasks/weekly-dupr-sync/SKILL.md`; this page mirrors it.
+
+## Watchdog
+
+A run that never starts sends no email, so a second scheduled task, **"DUPR
+sync watchdog"** (`~/.claude/scheduled-tasks/dupr-sync-watchdog/SKILL.md`),
+runs every Monday around noon. It issues one read-only query, `MAX
+(dupr_synced_at)` over linked profiles, and emails hun@ghkim.com only when the
+newest stamp is older than two days or fewer than half the linked players were
+stamped. A healthy week is silent. It needs the Cloudflare and Gmail
+connectors, and nothing else.
 
 The app (`src/lib/dupr.ts` → `effectiveDupr`) uses `dupr_rating` when it is
 inside 1.000–8.500 and falls back to `self_reported_dupr` otherwise, so a
@@ -41,6 +56,9 @@ users page shows both plus the sync date; the profile page shows the official
 number read-only.
 
 Requirements for a run to succeed: the Claude desktop app is open, Chrome is
-open with the Claude in Chrome extension connected, and that Chrome profile is
-signed in to dupr.com. If the app is closed when the task is due, it runs on
-next launch.
+open with the Claude in Chrome extension connected, that Chrome profile is
+signed in to dupr.com, and the task has the Cloudflare and Gmail connectors
+attached (the 2026-11-02 run stopped because Cloudflare was not). If the app is
+closed when the task is due, it runs on next launch. Tool approvals given
+during a run are stored on the task, so one manual "Run now" from the task's
+page pre-approves D1, Chrome and Gmail for unattended runs.
