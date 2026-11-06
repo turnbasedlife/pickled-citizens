@@ -1,7 +1,14 @@
 import { count, desc, eq, inArray, like } from 'drizzle-orm';
 import { getDbAsync } from '../client';
 import { chunkedInArray } from '../chunk';
-import { adminEvents, leagueMembers, leagues, profiles, type AdminEvent } from '../schema';
+import {
+  adminEvents,
+  leagueMembers,
+  leagues,
+  profiles,
+  type AdminEvent,
+  type NewAdminEvent,
+} from '../schema';
 import { encodeJson, decodeJson, type Json } from '../json';
 
 export type AdminEventOut = Omit<AdminEvent, 'payload'> & { payload: Json | null };
@@ -49,26 +56,45 @@ export async function countFailedAdminEvents(): Promise<number> {
   return rows[0]?.n ?? 0;
 }
 
-export async function logAdminEvent(input: {
+export type AdminEventInput = {
   eventType: string;
   userId?: string | null;
   userEmail?: string | null;
+  /**
+   * Must name a league that still exists: `admin_events.league_id` is a
+   * foreign key and D1 enforces it, so a row pointing at a deleted league is
+   * rejected. An event about a league that is gone carries the id in its
+   * payload instead.
+   */
   leagueId?: string | null;
   payload?: Json | null;
-}): Promise<void> {
+};
+
+/**
+ * The row one event becomes. Shared by `logAdminEvent` and by the deletes
+ * that write their log row in the same batch as the delete itself.
+ */
+export function adminEventRow(input: AdminEventInput): NewAdminEvent {
+  return {
+    id: crypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+    eventType: input.eventType,
+    userId: input.userId ?? null,
+    userEmail: input.userEmail ?? null,
+    leagueId: input.leagueId ?? null,
+    payload: encodeJson(input.payload ?? null),
+  };
+}
+
+export async function logAdminEvent(input: AdminEventInput): Promise<void> {
   // Never throws: callers log after their primary write has landed, and a
-  // failed audit row must not turn a successful create/delete into an error.
+  // failed audit row must not turn a successful create into an error. That
+  // trade is wrong for a delete, where the row is the only copy of what was
+  // removed — deletes pass their event to the query instead, which writes it
+  // in the same batch (see deleteSession, deleteLeague, deleteUserAppData).
   try {
     const db = await getDbAsync();
-    await db.insert(adminEvents).values({
-      id: crypto.randomUUID(),
-      createdAt: new Date().toISOString(),
-      eventType: input.eventType,
-      userId: input.userId ?? null,
-      userEmail: input.userEmail ?? null,
-      leagueId: input.leagueId ?? null,
-      payload: encodeJson(input.payload ?? null),
-    });
+    await db.insert(adminEvents).values(adminEventRow(input));
   } catch (err) {
     console.error(`logAdminEvent(${input.eventType}) failed:`, err);
   }
@@ -126,12 +152,41 @@ const MEMBER_INSERT_CHUNK = 18;
  *
  * Caller is responsible for deleting the Clerk user via Clerk Backend API.
  *
- * Note: D1 batch is sequential; on partial failure the operation is *not*
- * rolled back. Any partial state should be cleaned up by re-running.
+ * Each owned league takes its whole roster with it, so each gets a
+ * `league.deleted` log row (name, owner, members) first — the same snapshot
+ * the league's own delete button writes. A D1 batch is one transaction: the
+ * snapshots and the deletes land together or not at all, and a re-run after
+ * the leagues are gone finds nothing to snapshot.
  */
 export async function deleteUserAppData(userId: string): Promise<void> {
   const db = await getDbAsync();
+  const owned = await db.select().from(leagues).where(eq(leagues.ownerId, userId));
+  const rosters =
+    owned.length === 0
+      ? []
+      : await chunkedInArray(
+          owned.map((l) => l.id),
+          (chunk) => db.select().from(leagueMembers).where(inArray(leagueMembers.leagueId, chunk)),
+        );
+  const snapshots = owned.map((league) =>
+    db.insert(adminEvents).values(
+      adminEventRow({
+        eventType: 'league.deleted',
+        // No leagueId: the league is deleted later in this same batch.
+        payload: {
+          league_id: league.id,
+          name: league.name,
+          owner_id: league.ownerId,
+          reason: 'owner_account_deleted',
+          members: rosters
+            .filter((m) => m.leagueId === league.id)
+            .map((m) => ({ user_id: m.userId, role: m.role, email: m.email ?? null })),
+        },
+      }),
+    ),
+  );
   const ops = [
+    ...snapshots,
     db.delete(leagueMembers).where(eq(leagueMembers.userId, userId)),
     db.delete(leagues).where(eq(leagues.ownerId, userId)),
     db.delete(profiles).where(eq(profiles.id, userId)),

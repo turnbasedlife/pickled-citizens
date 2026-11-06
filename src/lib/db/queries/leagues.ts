@@ -2,6 +2,7 @@ import { and, eq, ne, inArray, count } from 'drizzle-orm';
 import { getDbAsync } from '../client';
 import { chunkedInArray } from '../chunk';
 import {
+  adminEvents,
   leagues,
   leagueMembers,
   type League,
@@ -10,6 +11,7 @@ import {
 } from '../schema';
 import { AuthorizationError } from '../auth-helpers';
 import { MAX_LEAGUES } from '@/lib/constants';
+import { adminEventRow, type AdminEventInput } from './admin';
 
 export async function listLeagues(): Promise<League[]> {
   const db = await getDbAsync();
@@ -198,12 +200,32 @@ export async function updateLeague(
   }
 }
 
-export async function deleteLeague(callerId: string, leagueId: string): Promise<void> {
+/**
+ * `event`, when given, is the delete's log row, written in the same batch as
+ * the delete (one transaction), so the roster snapshot and the delete land
+ * together or not at all. The row never carries `leagueId`: that column is a
+ * foreign key to the league being deleted here, and D1 rejects a row pointing
+ * at a league that is gone — which, with a logger that swallows errors, is how
+ * `league.deleted` rows silently went missing. The id belongs in the payload.
+ */
+export async function deleteLeague(
+  callerId: string,
+  leagueId: string,
+  event?: Omit<AdminEventInput, 'leagueId'>,
+): Promise<void> {
   if (!(await isLeagueOwner(leagueId, callerId))) {
     throw new AuthorizationError(403, 'Only the league owner can delete the league');
   }
   const db = await getDbAsync();
-  await db.delete(leagues).where(eq(leagues.id, leagueId));
+  const remove = db.delete(leagues).where(eq(leagues.id, leagueId));
+  if (!event) {
+    await remove;
+    return;
+  }
+  await db.batch([
+    db.insert(adminEvents).values(adminEventRow({ ...event, leagueId: null })),
+    remove,
+  ]);
 }
 
 export async function addMember(

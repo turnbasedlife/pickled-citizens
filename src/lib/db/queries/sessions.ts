@@ -1,6 +1,7 @@
 import { eq } from 'drizzle-orm';
 import { getDbAsync } from '../client';
 import {
+  adminEvents,
   gameSessions,
   sessionGuests,
   type GameSession,
@@ -9,6 +10,7 @@ import {
 } from '../schema';
 import { AuthorizationError } from '../auth-helpers';
 import { isLeagueAdmin, isLeagueMember } from './leagues';
+import { adminEventRow, type AdminEventInput } from './admin';
 
 export async function getSessionById(id: string): Promise<GameSession | null> {
   const db = await getDbAsync();
@@ -68,14 +70,29 @@ export async function createSession(
   return created;
 }
 
-export async function deleteSession(callerId: string, sessionId: string): Promise<void> {
+/**
+ * `event`, when given, is the delete's log row, written in the same batch as
+ * the delete. A D1 batch is one transaction, so the session cannot go without
+ * its row landing: the cascade removes matches, players, scores and guests,
+ * and that row is the only copy left. A failed insert fails the delete.
+ */
+export async function deleteSession(
+  callerId: string,
+  sessionId: string,
+  event?: AdminEventInput,
+): Promise<void> {
   const session = await getSessionById(sessionId);
   if (!session) return;
   if (!(await canManageSession(callerId, session))) {
     throw new AuthorizationError(403, 'Cannot delete this session');
   }
   const db = await getDbAsync();
-  await db.delete(gameSessions).where(eq(gameSessions.id, sessionId));
+  const remove = db.delete(gameSessions).where(eq(gameSessions.id, sessionId));
+  if (!event) {
+    await remove;
+    return;
+  }
+  await db.batch([db.insert(adminEvents).values(adminEventRow(event)), remove]);
 }
 
 // ---- Session guests ----

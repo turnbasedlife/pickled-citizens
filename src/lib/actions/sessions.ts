@@ -101,7 +101,9 @@ export async function getSessionDetail(sessionId: string) {
  * Deleting a session cascades its matches, players, scores and guests, and
  * those games leave the league rankings with no undo. The log row therefore
  * keeps a full snapshot — enough to say whose session it was and to re-enter
- * it by hand if the delete was a mistake — not just the id.
+ * it by hand if the delete was a mistake — not just the id. The row goes to
+ * `deleteSession`, which writes it in the same batch as the delete, so the
+ * session is never gone without its snapshot.
  */
 export async function deleteSessionAction(input: { sessionId: string }) {
   const userId = await requireUserId();
@@ -153,8 +155,7 @@ export async function deleteSessionAction(input: { sessionId: string }) {
   };
 
   const callerEmail = await getCurrentEmail();
-  await deleteSession(userId, session.id);
-  await logAdminEvent({
+  await deleteSession(userId, session.id, {
     eventType: 'session.deleted',
     userId,
     userEmail: callerEmail,

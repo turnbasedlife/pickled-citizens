@@ -151,7 +151,9 @@ export async function renameLeagueAction(input: { leagueId: string; name: string
 /**
  * Deleting a league drops every membership row and orphans its sessions
  * (`league_id` set to null). The log keeps the name and roster so the row
- * says what was deleted, not just which id.
+ * says what was deleted, not just which id. The row goes to `deleteLeague`,
+ * which writes it in the same batch as the delete; the league's id lives in
+ * the payload because the row cannot point at a league that no longer exists.
  */
 export async function deleteLeagueAction(input: { leagueId: string }) {
   const userId = await requireUserId();
@@ -162,13 +164,12 @@ export async function deleteLeagueAction(input: { leagueId: string }) {
     throw new AuthorizationError(403, 'Only the league owner can delete the league');
   }
   const members = await listMembersOfLeague(input.leagueId);
-  await deleteLeague(userId, input.leagueId);
-  await logAdminEvent({
+  await deleteLeague(userId, input.leagueId, {
     eventType: 'league.deleted',
     userId,
     userEmail: email,
-    leagueId: input.leagueId,
     payload: {
+      league_id: league.id,
       name: league.name,
       owner_id: league.ownerId,
       members: members.map((m) => ({ user_id: m.userId, role: m.role, email: m.email ?? null })),

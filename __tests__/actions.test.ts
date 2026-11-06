@@ -9,7 +9,10 @@ import { useDb } from './helpers/fake-db';
 
 vi.mock('@/lib/db/client', async () => (await import('./helpers/fake-db')).dbMock);
 vi.mock('next/cache', () => ({ revalidatePath: vi.fn() }));
-vi.mock('@/lib/db/queries/admin', () => ({ logAdminEvent: vi.fn(async () => undefined) }));
+vi.mock('@/lib/db/queries/admin', async () => ({
+  ...(await vi.importActual<typeof import('@/lib/db/queries/admin')>('@/lib/db/queries/admin')),
+  logAdminEvent: vi.fn(async () => undefined),
+}));
 const clerkUsers = { updateUser: vi.fn(async () => ({})) };
 vi.mock('@/lib/clerk', async () => {
   const actual = await vi.importActual<typeof import('@/lib/clerk')>('@/lib/clerk');
@@ -108,7 +111,19 @@ describe('getSessionDetail', () => {
   });
 });
 
+/**
+ * The log row a delete wrote: the first statement of its one batch, ahead of
+ * the delete itself, with the payload decoded.
+ */
+function batchedEvent(h: { batches: unknown[][] }) {
+  expect(h.batches).toHaveLength(1);
+  expect(h.batches[0]).toHaveLength(2);
+  const row = (h.batches[0][0] as { insert: Record<string, unknown> }).insert;
+  return { ...row, payload: JSON.parse(row.payload as string) };
+}
+
 describe('deleteSessionAction', () => {
+  // The swallow-errors logger must stay out of deletes entirely.
   async function logged() {
     const { logAdminEvent } = await import('@/lib/db/queries/admin');
     return vi.mocked(logAdminEvent).mock.calls.map((c) => c[0]);
@@ -140,9 +155,8 @@ describe('deleteSessionAction', () => {
     ]);
     expect(await deleteSessionAction({ sessionId: 'S1' })).toEqual({ ok: true });
     expect(h.deleteCalls).toHaveLength(1);
-    const events = await logged();
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
+    expect(await logged()).toEqual([]);
+    expect(batchedEvent(h)).toMatchObject({
       eventType: 'session.deleted',
       userId: 'admin',
       leagueId: 'L1',
@@ -190,7 +204,17 @@ describe('deleteSessionAction', () => {
     const h = useDb([[]]);
     expect(await deleteSessionAction({ sessionId: 'missing' })).toEqual({ ok: true });
     expect(h.deleteCalls).toHaveLength(0);
+    expect(h.batches).toEqual([]);
     expect(await logged()).toEqual([]);
+  });
+
+  it('fails the delete out loud when the snapshot row cannot be written', async () => {
+    await signInAs('creator');
+    const { deleteSessionAction } = await import('@/lib/actions/sessions');
+    // Creator: no league lookups. Session, matches (none), guests, then deleteSession's re-read.
+    const h = useDb([[session], [], [], [session]]);
+    h.db.batch = () => Promise.reject(new Error('D1_ERROR: FOREIGN KEY constraint failed'));
+    await expect(deleteSessionAction({ sessionId: 'S1' })).rejects.toThrow(/FOREIGN KEY/);
   });
 });
 
@@ -210,10 +234,16 @@ describe('deleteLeagueAction', () => {
     expect(await deleteLeagueAction({ leagueId: 'L1' })).toEqual({ ok: true });
     expect(h.deleteCalls).toHaveLength(1);
     const { logAdminEvent } = await import('@/lib/db/queries/admin');
-    expect(vi.mocked(logAdminEvent).mock.calls[0][0]).toMatchObject({
+    expect(vi.mocked(logAdminEvent)).not.toHaveBeenCalled();
+    // league_id is a foreign key to the league this same batch deletes: a row
+    // that pointed at it would be rejected, so the id travels in the payload.
+    expect(batchedEvent(h)).toMatchObject({
       eventType: 'league.deleted',
-      leagueId: 'L1',
+      userId: 'creator',
+      userEmail: 'caller@example.com',
+      leagueId: null,
       payload: {
+        league_id: 'L1',
         name: 'Tuesday Crew',
         owner_id: 'creator',
         members: [
@@ -232,6 +262,7 @@ describe('deleteLeagueAction', () => {
       statusCode: 403,
     });
     expect(h.deleteCalls).toHaveLength(0);
+    expect(h.batches).toEqual([]);
     const { logAdminEvent } = await import('@/lib/db/queries/admin');
     expect(vi.mocked(logAdminEvent)).not.toHaveBeenCalled();
   });

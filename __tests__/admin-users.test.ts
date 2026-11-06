@@ -53,6 +53,63 @@ describe('adminAddUserToLeagues', () => {
 });
 
 /**
+ * Deleting an account deletes the leagues it owns, rosters and all. Each one
+ * must leave a `league.deleted` row behind, written in the same batch and
+ * never pointing at the league (a foreign key the delete would violate).
+ */
+describe('deleteUserAppData', () => {
+  it('snapshots every owned league ahead of the deletes, in one batch', async () => {
+    const fake = useDb([
+      [
+        { id: 'L1', name: 'Tuesday Crew', ownerId: 'u1' },
+        { id: 'L2', name: 'Empty', ownerId: 'u1' },
+      ],
+      [
+        { leagueId: 'L1', userId: 'u1', role: 'admin', email: 'u1@example.com' },
+        { leagueId: 'L1', userId: 'p2', role: 'player', email: null },
+      ],
+    ]);
+    const { deleteUserAppData } = await import('@/lib/db/queries/admin');
+    await deleteUserAppData('u1');
+    expect(fake.batches).toHaveLength(1);
+    const ops = fake.batches[0] as Array<{ insert?: Record<string, unknown> }>;
+    expect(ops).toHaveLength(5); // two snapshots, then members, leagues, profile
+    expect(fake.deleteCalls).toHaveLength(3);
+    const events = ops.slice(0, 2).map((op) => ({
+      ...op.insert,
+      payload: JSON.parse(op.insert?.payload as string),
+    }));
+    expect(events[0]).toMatchObject({
+      eventType: 'league.deleted',
+      leagueId: null,
+      payload: {
+        league_id: 'L1',
+        name: 'Tuesday Crew',
+        owner_id: 'u1',
+        reason: 'owner_account_deleted',
+        members: [
+          { user_id: 'u1', role: 'admin', email: 'u1@example.com' },
+          { user_id: 'p2', role: 'player', email: null },
+        ],
+      },
+    });
+    expect(events[1]).toMatchObject({
+      leagueId: null,
+      payload: { league_id: 'L2', members: [] },
+    });
+  });
+
+  it('writes no league rows for a user who owns none', async () => {
+    const fake = useDb([[]]);
+    const { deleteUserAppData } = await import('@/lib/db/queries/admin');
+    await deleteUserAppData('u1');
+    expect(fake.selectsUsed()).toBe(1);
+    expect(fake.batches[0]).toHaveLength(3);
+    expect(fake.inserts).toEqual([]);
+  });
+});
+
+/**
  * Route-level checks for /api/admin/users: the gate runs before any Clerk or
  * database call, every body field is validated on the server, and the two
  * failure modes the UI cannot recover from on its own — a duplicate email and
