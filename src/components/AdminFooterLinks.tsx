@@ -20,7 +20,7 @@ export function AdminFooterLinks() {
         </>
       )}
       <Link
-        href="https://github.com/consumedsoul/pickled-citizens"
+        href="https://github.com/turnbasedlife/pickled-citizens"
         target="_blank"
         rel="noreferrer"
         className="no-underline hover:text-app-text transition-colors"
