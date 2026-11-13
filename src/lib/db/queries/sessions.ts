@@ -5,7 +5,6 @@ import {
   gameSessions,
   sessionGuests,
   type GameSession,
-  type NewGameSession,
   type SessionGuest,
 } from '../schema';
 import { AuthorizationError } from '../auth-helpers';
@@ -53,23 +52,6 @@ export async function canViewSession(
   return false;
 }
 
-export async function createSession(
-  callerId: string,
-  input: Omit<NewGameSession, 'id' | 'createdBy' | 'createdAt'>,
-): Promise<GameSession> {
-  const db = await getDbAsync();
-  const id = crypto.randomUUID();
-  await db.insert(gameSessions).values({
-    id,
-    createdBy: callerId,
-    createdAt: new Date().toISOString(),
-    ...input,
-  });
-  const created = await getSessionById(id);
-  if (!created) throw new Error('Failed to create session');
-  return created;
-}
-
 /**
  * `event`, when given, is the delete's log row, written in the same batch as
  * the delete. A D1 batch is one transaction, so the session cannot go without
@@ -100,39 +82,4 @@ export async function deleteSession(
 export async function listGuestsForSession(sessionId: string): Promise<SessionGuest[]> {
   const db = await getDbAsync();
   return db.select().from(sessionGuests).where(eq(sessionGuests.sessionId, sessionId));
-}
-
-/**
- * Insert a session's guests in one batch. Authorizes once — the answer cannot
- * change between rows — and generates IDs here so the caller gets them back in
- * input order without reading the rows back.
- */
-export async function addGuests(
-  callerId: string,
-  sessionId: string,
-  guests: ReadonlyArray<{ displayName: string; dupr: number }>,
-): Promise<string[]> {
-  if (guests.length === 0) return [];
-  const session = await getSessionById(sessionId);
-  if (!session) throw new AuthorizationError(404, 'Session not found');
-  if (!(await canManageSession(callerId, session))) {
-    throw new AuthorizationError(403, 'Cannot add guests to this session');
-  }
-  const db = await getDbAsync();
-  const now = new Date().toISOString();
-  const rows = guests.map((g) => ({
-    id: crypto.randomUUID(),
-    sessionId,
-    displayName: g.displayName.trim(),
-    dupr: g.dupr,
-    createdAt: now,
-  }));
-  // 5 bound columns per row; 15 rows keeps each statement under D1's 100-param cap.
-  const INSERT_CHUNK = 15;
-  const ops = [];
-  for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
-    ops.push(db.insert(sessionGuests).values(rows.slice(i, i + INSERT_CHUNK)));
-  }
-  await db.batch(ops as [(typeof ops)[number], ...(typeof ops)[number][]]);
-  return rows.map((r) => r.id);
 }

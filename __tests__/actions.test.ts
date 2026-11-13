@@ -433,9 +433,8 @@ describe('createSessionWithTeamsAction', () => {
   });
 
   it('refuses a match plan it cannot build before creating the session', async () => {
-    // The session, guests and matches are three unrelated D1 writes, so a plan
-    // that references a guest the request never defined must fail before the
-    // first of them, not leave an empty session behind.
+    // A plan that references a guest the request never defined must fail with
+    // its own message before anything is written.
     await signInAs('caller');
     const { createSessionWithTeamsAction } = await import('@/lib/actions/sessions');
     const h = useDb([
@@ -499,5 +498,56 @@ describe('createSessionWithTeamsAction', () => {
       'Not a member of this league',
     );
     expect(h.selectsUsed()).toBe(2);
+  });
+
+  it('creates the session, guest, match and players in one batch and logs it', async () => {
+    await signInAs('caller');
+    const { createSessionWithTeamsAction } = await import('@/lib/actions/sessions');
+    const { logAdminEvent } = await import('@/lib/db/queries/admin');
+    const h = useDb([[league], [{ userId: 'caller' }], [league], [{ userId: 'caller' }]]);
+    const { sessionId } = await createSessionWithTeamsAction({
+      ...input,
+      guests: [{ syntheticId: 'g1', displayName: 'Ringer', dupr: 3.5 }],
+      matches: [
+        {
+          scheduledOrder: 0,
+          players: [
+            { userId: 'caller', team: 1 as const, position: 0 as const },
+            { syntheticId: 'g1', team: 2 as const, position: 0 as const },
+          ],
+        },
+      ],
+    });
+    // No read-back: the four gate lookups are the only selects.
+    expect(h.selectsUsed()).toBe(4);
+    expect(h.batches).toHaveLength(1);
+    const ops = h.batches[0] as Array<{ insert: unknown }>;
+    expect(ops).toHaveLength(4); // session, guests, matches, players
+    expect(ops[0].insert).toMatchObject({ id: sessionId, createdBy: 'caller', leagueId: 'L1' });
+    const guestId = (ops[1].insert as Array<{ id: string }>)[0].id;
+    expect(ops[3].insert).toMatchObject([
+      { userId: 'caller', guestId: null, team: 1 },
+      { userId: null, guestId, team: 2 },
+    ]);
+    expect(vi.mocked(logAdminEvent).mock.calls[0][0]).toMatchObject({
+      eventType: 'session.created',
+      leagueId: 'L1',
+      payload: { session_id: sessionId, player_count: 8 },
+    });
+  });
+});
+
+describe('recordMatchResultAction', () => {
+  it('refuses a missing, fractional or negative score before reading anything', async () => {
+    await signInAs('creator');
+    const { recordMatchResultAction } = await import('@/lib/actions/sessions');
+    const h = useDb([]);
+    for (const bad of [null, undefined, 0.5, -1, Number.NaN, '1']) {
+      await expect(
+        recordMatchResultAction({ matchId: 'M1', team1Score: 1, team2Score: bad as number }),
+      ).rejects.toThrow('Scores must be whole numbers');
+    }
+    expect(h.selectsUsed()).toBe(0);
+    expect(h.batches).toEqual([]);
   });
 });

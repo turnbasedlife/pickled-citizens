@@ -5,11 +5,9 @@ import { effectiveDupr, isDuprInRange, DUPR_RANGE_ERROR } from '@/lib/dupr';
 import { revalidatePath } from 'next/cache';
 import { requireUserId, getCurrentEmail, AuthorizationError } from '@/lib/db/auth-helpers';
 import {
-  createSession,
   deleteSession,
   getSessionById,
   listGuestsForSession,
-  addGuests,
   canManageSession,
   canViewSession,
 } from '@/lib/db/queries/sessions';
@@ -17,9 +15,8 @@ import {
   listMatchesForSession,
   listPlayersForMatches,
   listResultsForMatches,
-  replaceSessionMatches,
-  upsertMatchResult,
-  updateMatchStatus,
+  createSessionWithMatches,
+  recordMatchResult,
   clearMatchResult,
 } from '@/lib/db/queries/matches';
 import {
@@ -169,27 +166,33 @@ export async function deleteSessionAction(input: { sessionId: string }) {
 
 export async function recordMatchResultAction(input: {
   matchId: string;
-  team1Score: number | null;
-  team2Score: number | null;
+  team1Score: number;
+  team2Score: number;
 }) {
   const userId = await requireUserId();
-  await upsertMatchResult(userId, input.matchId, {
+  // A recorded result marks the match completed and feeds the league board,
+  // so it must be two real scores. The page only ever sends 1 and 0, but this
+  // is POST-reachable: a missing or fractional score is refused here.
+  for (const score of [input.team1Score, input.team2Score]) {
+    if (!Number.isInteger(score) || score < 0) {
+      throw new Error('Scores must be whole numbers, zero or more');
+    }
+  }
+  await recordMatchResult(userId, input.matchId, {
     team1Score: input.team1Score,
     team2Score: input.team2Score,
   });
-  await updateMatchStatus(userId, input.matchId, 'completed');
   return { ok: true };
 }
 
 export async function clearMatchResultAction(input: { matchId: string }) {
   const userId = await requireUserId();
   await clearMatchResult(userId, input.matchId);
-  await updateMatchStatus(userId, input.matchId, 'scheduled');
   return { ok: true };
 }
 
 /**
- * Create a session, matches, guests, and match_players in one shot.
+ * Create a session, matches, guests, and match_players in one batch.
  */
 export async function createSessionWithTeamsAction(input: {
   leagueId: string;
@@ -230,15 +233,11 @@ export async function createSessionWithTeamsAction(input: {
     if (!Number.isFinite(n) || !isDuprInRange(n)) throw new Error(DUPR_RANGE_ERROR);
     if (!g.displayName?.trim()) throw new Error('Every guest needs a name');
   }
-  // Resolve the whole match plan before the first write. The session, its
-  // guests and its matches are three separate D1 writes with no transaction,
-  // so a plan that cannot be built (a player with neither ID, a guest ID the
-  // request never defined) must fail here, not after an empty session exists.
+  // Resolve the whole match plan before writing: a plan that cannot be built
+  // (a player with neither ID, a guest ID the request never defined) fails
+  // here with a message the form can show, not as a database error.
   const guestIndexBySyntheticId = new Map(input.guests.map((g, i) => [g.syntheticId, i] as const));
-  const newMatches = input.matches.map((m) => ({
-    scheduledOrder: m.scheduledOrder,
-    status: 'scheduled' as const,
-  }));
+  const newMatches = input.matches.map((m) => ({ scheduledOrder: m.scheduledOrder }));
   const plan: Array<{
     matchIndex: number;
     userId?: string;
@@ -261,24 +260,19 @@ export async function createSessionWithTeamsAction(input: {
   });
   const callerEmail = await getCurrentEmail();
 
-  const session = await createSession(userId, {
-    leagueId: input.leagueId,
-    scheduledFor: input.scheduledFor,
-    playerCount: input.playerCount,
-    location: null,
-  });
-
-  // Create guests; guestIds[i] is the real DB id of input.guests[i]
-  const guestIds = await addGuests(userId, session.id, input.guests);
-  const newPlayers = plan.map((p) => ({
-    matchIndex: p.matchIndex,
-    userId: p.userId ?? null,
-    guestId: p.guestIndex === undefined ? null : guestIds[p.guestIndex],
-    team: p.team,
-    position: p.position,
-  }));
-
-  await replaceSessionMatches(userId, session.id, newMatches, newPlayers);
+  // Session, guests, matches and players land in one batch: all or nothing.
+  const session = await createSessionWithMatches(
+    userId,
+    {
+      leagueId: input.leagueId,
+      scheduledFor: input.scheduledFor,
+      playerCount: input.playerCount,
+      location: null,
+    },
+    input.guests,
+    newMatches,
+    plan,
+  );
 
   await logAdminEvent({
     eventType: 'session.created',

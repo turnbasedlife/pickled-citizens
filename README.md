@@ -6,7 +6,7 @@ match results with lifetime statistics.
 
 **Live site:** [pickledcitizens.com](https://pickledcitizens.com)
 
-> _Last updated: 2026-10-30_
+> _Last updated: 2026-11-13_
 
 ---
 
@@ -78,7 +78,7 @@ src/
     clerk.ts               Clerk Backend API client + name length bound
 middleware.ts              Clerk middleware — CSP nonce + /admin gating
 drizzle/                   Drizzle-generated D1 migrations
-__tests__/                 Vitest tests (team generation, authorization, standings, DUPR, actions, admin users, webhook)
+__tests__/                 Vitest tests (team generation, authorization, standings, DUPR, actions, admin users, webhook, real local D1)
 docs/dupr-sync.md          How the weekly official-DUPR sync runs
 ```
 

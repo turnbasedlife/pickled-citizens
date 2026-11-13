@@ -358,7 +358,54 @@ describe('clearMatchResult', () => {
       [{ id: 'L1', ownerId: 'owner' }],
     ]);
     await clearMatchResult('owner', 'M1');
+    // The score row goes and the match returns to scheduled, in one batch.
+    expect(h.batches).toHaveLength(1);
+    expect(h.batches[0]).toHaveLength(2);
     expect(h.deleteCalls).toHaveLength(1);
+    expect(h.updates).toHaveLength(1);
+  });
+});
+
+describe('recordMatchResult', () => {
+  it('saves the score and marks the match completed in one batch', async () => {
+    const { recordMatchResult } = await import('@/lib/db/queries/matches');
+    const h = useDb([
+      [{ id: 'M1', sessionId: 'S1' }],
+      [{ id: 'S1', createdBy: 'creator', leagueId: 'L1' }],
+    ]);
+    await recordMatchResult('creator', 'M1', { team1Score: 1, team2Score: 0 });
+    // One gate (match, then session), not one per write.
+    expect(h.selectsUsed()).toBe(2);
+    expect(h.batches).toHaveLength(1);
+    expect(h.batches[0]).toHaveLength(2);
+    expect(h.inserts).toEqual([
+      expect.objectContaining({ matchId: 'M1', team1Score: 1, team2Score: 0 }),
+    ]);
+    expect(h.updates).toHaveLength(1);
+  });
+
+  it('rejects a league member who cannot manage the session', async () => {
+    const { recordMatchResult } = await import('@/lib/db/queries/matches');
+    const h = useDb([
+      [{ id: 'M1', sessionId: 'S1' }],
+      [{ id: 'S1', createdBy: 'creator', leagueId: 'L1' }],
+      [{ id: 'L1', ownerId: 'owner' }],
+    ]);
+    await expect(
+      recordMatchResult('member', 'M1', { team1Score: 1, team2Score: 0 }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(h.batches).toEqual([]);
+    expect(h.inserts).toEqual([]);
+    expect(h.updates).toHaveLength(0);
+  });
+
+  it('fails closed on a match that does not exist', async () => {
+    const { recordMatchResult } = await import('@/lib/db/queries/matches');
+    const h = useDb([[]]);
+    await expect(
+      recordMatchResult('anyone', 'missing', { team1Score: 1, team2Score: 0 }),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    expect(h.batches).toEqual([]);
   });
 });
 
@@ -413,37 +460,57 @@ describe('updateLeague (rename)', () => {
   });
 });
 
-describe('addGuests', () => {
+describe('createSessionWithMatches', () => {
   const guests = (n: number) =>
-    Array.from({ length: n }, (_, i) => ({ displayName: `G${i}`, dupr: 3 }));
+    Array.from({ length: n }, (_, i) => ({ displayName: ` G${i} `, dupr: 3 }));
+  const input = { leagueId: 'L1', scheduledFor: null, playerCount: 8 as const, location: null };
+  type Op = { insert: Record<string, unknown> | Array<Record<string, unknown>> };
 
-  it('authorizes once and writes every guest in one batch, chunked under the param cap', async () => {
-    const { addGuests } = await import('@/lib/db/queries/sessions');
-    const h = useDb([[{ id: 's1', createdBy: 'u1', leagueId: 'L1' }]]);
-    const ids = await addGuests('u1', 's1', guests(16));
-    expect(ids).toHaveLength(16);
-    expect(new Set(ids).size).toBe(16);
-    expect(h.selectsUsed()).toBe(1);
-    expect(h.batches).toHaveLength(1);
-    expect(h.batches[0]).toHaveLength(2); // 15 + 1
-  });
-
-  it('refuses a caller who cannot manage the session', async () => {
-    const { addGuests } = await import('@/lib/db/queries/sessions');
-    const h = useDb([
-      [{ id: 's1', createdBy: 'owner', leagueId: 'L1' }],
-      [{ id: 'L1', ownerId: 'owner' }],
-    ]);
-    await expect(addGuests('stranger', 's1', guests(1))).rejects.toMatchObject({
-      statusCode: 403,
-    });
-    expect(h.batches).toHaveLength(0);
-  });
-
-  it('does nothing for an empty guest list', async () => {
-    const { addGuests } = await import('@/lib/db/queries/sessions');
+  it('writes session, guests, matches and players in one batch, parents first', async () => {
+    const { createSessionWithMatches } = await import('@/lib/db/queries/matches');
     const h = useDb([]);
-    expect(await addGuests('u1', 's1', [])).toEqual([]);
+    const session = await createSessionWithMatches(
+      'u1',
+      input,
+      guests(16),
+      [{ scheduledOrder: 0 }, { scheduledOrder: 1 }],
+      [
+        { matchIndex: 0, userId: 'u1', team: 1, position: 0 },
+        { matchIndex: 1, guestIndex: 15, team: 2, position: 1 },
+      ],
+    );
     expect(h.selectsUsed()).toBe(0);
+    expect(h.batches).toHaveLength(1);
+    const ops = h.batches[0] as Op[];
+    // session, guests 15 + 1 (under the 100-value cap), matches, players
+    expect(ops).toHaveLength(5);
+    expect(ops[0].insert).toMatchObject({ id: session.id, createdBy: 'u1', leagueId: 'L1' });
+    const guestRows = [...(ops[1].insert as Op[]), ...(ops[2].insert as Op[])] as unknown as Array<
+      Record<string, unknown>
+    >;
+    expect(guestRows).toHaveLength(16);
+    expect(guestRows.every((g) => g.sessionId === session.id)).toBe(true);
+    expect(guestRows[0].displayName).toBe('G0');
+    const matchRows = ops[3].insert as Array<Record<string, unknown>>;
+    expect(matchRows.map((m) => [m.sessionId, m.scheduledOrder, m.status])).toEqual([
+      [session.id, 0, 'scheduled'],
+      [session.id, 1, 'scheduled'],
+    ]);
+    expect(ops[4].insert).toMatchObject([
+      { matchId: matchRows[0].id, userId: 'u1', guestId: null, team: 1, position: 0 },
+      { matchId: matchRows[1].id, userId: null, guestId: guestRows[15].id, team: 2, position: 1 },
+    ]);
+    expect(session).toMatchObject({ leagueId: 'L1', playerCount: 8, scheduledFor: null });
+  });
+
+  it('leaves nothing behind when the batch fails', async () => {
+    const { createSessionWithMatches } = await import('@/lib/db/queries/matches');
+    const h = useDb([]);
+    h.db.batch = () => Promise.reject(new Error('D1_ERROR: boom'));
+    await expect(
+      createSessionWithMatches('u1', input, [], [{ scheduledOrder: 0 }], []),
+    ).rejects.toThrow('boom');
+    // Nothing was written outside the batch that failed.
+    expect(h.inserts).toEqual([]);
   });
 });
