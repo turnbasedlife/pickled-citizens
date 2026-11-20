@@ -78,21 +78,30 @@ describe.skipIf(!canListen)('against a real local D1', () => {
     matchId = (await db().select().from(schema.matches))[0].id;
   });
 
-  it('rolls the whole create back when one row is refused', async () => {
+  it('rolls the whole create back when the last row is refused', async () => {
     const { createSessionWithMatches } = await import('@/lib/db/queries/matches');
+    // Everything is valid except the very last player row (team is constrained
+    // to 1 or 2). 16 players span two insert statements, so the session, the
+    // guests, the match and the first 15 players have all been written inside
+    // the batch by the time D1 refuses the final statement.
     await expect(
       createSessionWithMatches(
         'owner',
-        // player_count is constrained to 6, 8, 10 or 12.
-        { leagueId: 'L1', scheduledFor: null, playerCount: 7 as 6, location: null },
-        [{ displayName: 'Ringer', dupr: 3.5 }],
+        { leagueId: 'L1', scheduledFor: null, playerCount: 6, location: null },
+        Array.from({ length: 16 }, (_, i) => ({ displayName: `Ringer ${i}`, dupr: 3.5 })),
         [{ scheduledOrder: 0 }],
-        [{ matchIndex: 0, userId: 'owner', team: 1, position: 0 }],
+        Array.from({ length: 16 }, (_, i) => ({
+          matchIndex: 0,
+          guestIndex: i,
+          team: (i === 15 ? 3 : 1) as 1,
+          position: i,
+        })),
       ),
     ).rejects.toThrow();
     expect(await count(schema.gameSessions)).toBe(1);
     expect(await count(schema.sessionGuests)).toBe(16);
     expect(await count(schema.matches)).toBe(20);
+    expect(await count(schema.matchPlayers)).toBe(40);
   });
 
   it('records a score and completes the match, then clears both', async () => {
